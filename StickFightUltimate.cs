@@ -9,8 +9,47 @@ using UnityEngine;
 
 namespace StickFightUltimate
 {
-    public class ModMain : MelonMod
+    // Custom slow fade component for longer-lasting clones
+    public class SlowFadeSprite : MonoBehaviour
     {
+        private SpriteRenderer sprite;
+        private LineRenderer line;
+        private float fadeSpeed = 0.1f; // Much slower than original 2f
+        
+        private void Start()
+        {
+            this.line = base.GetComponent<LineRenderer>();
+            this.sprite = base.GetComponent<SpriteRenderer>();
+        }
+        
+        private void Update()
+        {
+            if (this.sprite)
+            {
+                this.sprite.color = new Color(this.sprite.color.r, this.sprite.color.g, this.sprite.color.b, this.sprite.color.a - Time.deltaTime * this.fadeSpeed);
+                if (this.sprite.color.a < 0f)
+                {
+                    base.gameObject.SetActive(false);
+                }
+            }
+            if (this.line)
+            {
+                this.line.material.color = new Color(this.line.material.color.r, this.line.material.color.g, this.line.material.color.b, this.line.material.color.a - Time.deltaTime * this.fadeSpeed);
+                if (this.line.material.color.a < 0f)
+                {
+                    base.gameObject.SetActive(false);
+                }
+            }
+        }
+    }
+
+public class ModMain : MelonMod
+    {
+        // Custom coroutine starter method
+        private void StartModCoroutine(System.Collections.IEnumerator routine)
+        {
+            MelonCoroutines.Start(routine);
+        }
         // All the UI stuff we need for our menu
         public bool showMenu = false;
         private Rect windowRect = new Rect(50, 50, 650, 800);
@@ -45,6 +84,13 @@ namespace StickFightUltimate
         public bool clickTeleport = false;
         public bool noClip = false;
         
+        // Clone functionality
+        public bool cloneMode = false;
+        
+        // Clone timing control - limit to 1 clone every 3 seconds
+        private float lastCloneTime = 0f;
+        private const float CLONE_COOLDOWN = 3f;
+        
         // Remember how things were so we can put them back later
         private bool originalCanFly = false;
         private bool collidersStored = false;
@@ -61,15 +107,52 @@ namespace StickFightUltimate
         private Controller localPlayer;
         private float lastUpdateTime = 0f;
         private const float UPDATE_INTERVAL = 0.1f;
+        
+        // Track instant win state for rising edge detection
+        private bool lastInstantWinState = false;
+        
+        // Cached reflection objects for performance
+        private static readonly System.Reflection.FieldInfo bulletsLeftField = typeof(Fighting).GetField("bulletsLeft", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        private static readonly System.Reflection.FieldInfo currentShotsField = typeof(Weapon).GetField("currentShots", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        
+        // Store original collider states for proper restoration
+        private Dictionary<Collider, bool> originalColliderStates = new Dictionary<Collider, bool>();
+        private Controller storedController = null;
+        private Collider[] cachedColliders = null;
 
         // All the tabs for our menu
-        private readonly string[] tabNames = { "Combat", "Weapons", "Player", "Utility", "Movement", "Settings" };
+        private readonly string[] tabNames = { "Combat", "Weapons", "Player", "Utility", "Clone", "Movement", "Settings" };
+
+        public override void OnDeinitializeMelon()
+        {
+            // Restore gameplay state before cleanup
+            RestoreOriginalState(storedController);
+            
+            // Clean up UI textures to prevent memory leaks
+            if (buttonNormalTexture != null) UnityEngine.Object.Destroy(buttonNormalTexture);
+            if (buttonHoverTexture != null) UnityEngine.Object.Destroy(buttonHoverTexture);
+            if (toggleTexture != null) UnityEngine.Object.Destroy(toggleTexture);
+            if (tabTexture != null) UnityEngine.Object.Destroy(tabTexture);
+            if (activeTabTexture != null) UnityEngine.Object.Destroy(activeTabTexture);
+            
+            MelonLogger.Msg("Stick Fight Ultimate v6.0 - Cleaned up and unloaded!");
+        }
 
         public override void OnInitializeMelon()
         {
             MelonLogger.Msg("Stick Fight Ultimate v6.0 - Clean Version Loaded!");
             MelonLogger.Msg($"Menu key set to: {menuKey}");
             MelonLogger.Msg($"God Mode key set to: {godModeKey}");
+            
+            // Reset instant win state on initialization
+            lastInstantWinState = false;
+            
+            // Log reflection field availability
+            if (bulletsLeftField == null)
+                MelonLogger.Msg("⚠ Warning: bulletsLeft field not found - infinite ammo may not work");
+            if (currentShotsField == null)
+                MelonLogger.Msg("⚠ Warning: currentShots field not found - infinite ammo may not work");
+            
             ApplyHarmonyPatches();
         }
 
@@ -112,10 +195,10 @@ namespace StickFightUltimate
             // Hold to shoot with no cooldown
             if (noCooldown && Input.GetMouseButton(0))
             {
-                var localPlayer = GetLocalPlayer();
-                if (localPlayer != null)
+                var controller = GetLocalPlayer();
+                if (controller != null)
                 {
-                    var fighting = localPlayer.GetComponent<Fighting>();
+                    var fighting = controller.GetComponent<Fighting>();
                     if (fighting != null && fighting.weapon != null && fighting.weapon.isGun)
                     {
                         // Make the game think we can shoot again
@@ -127,62 +210,62 @@ namespace StickFightUltimate
                 }
             }
 
-            if (clickTeleport && Input.GetMouseButtonDown(1))
+            // Right-click teleport (only when menu is closed)
+            if (clickTeleport && Input.GetMouseButtonDown(1) && !showMenu)
             {
                 TeleportToMousePosition();
             }
 
+            // Update local player reference periodically
             if (Time.time - lastUpdateTime > UPDATE_INTERVAL)
             {
                 localPlayer = GetLocalPlayer();
                 lastUpdateTime = Time.time;
             }
 
-            if (localPlayer != null)
+            // Clone mode - create duplicate of player (limited to 1 every 3 seconds)
+            if (cloneMode && localPlayer != null)
             {
-                ApplyMovementCheats();
+                if (Time.time - lastCloneTime >= CLONE_COOLDOWN)
+                {
+                    ClonePlayer();
+                    lastCloneTime = Time.time;
+                }
             }
 
+            // Instant Win - trigger once when enabled (rising edge detection)
+            bool currentInstantWinState = instantWin;
+            
+            if (currentInstantWinState && !lastInstantWinState)
+            {
+                InstantWin();
+                instantWin = false; // Auto-disable after triggering
+            }
+            
+            lastInstantWinState = currentInstantWinState;
             // GOD MODE - keep us alive no matter what
             if (godMode)
             {
-                var controller = GetLocalPlayer();
-                if (controller != null)
+                if (localPlayer != null)
                 {
-                    var health = controller.GetComponent<HealthHandler>();
+                    var health = localPlayer.GetComponent<HealthHandler>();
                     if (health != null)
                     {
                         health.health = 999999f;
-                        var charInfo = controller.GetComponent<CharacterInformation>();
+                        var charInfo = localPlayer.GetComponent<CharacterInformation>();
                         if (charInfo != null)
                         {
                             charInfo.isDead = false;
                         }
                         
                         // Stop us from getting knocked around
-                        var rb = controller.GetComponent<Rigidbody>();
+                        var rb = localPlayer.GetComponent<Rigidbody>();
                         if (rb != null)
                         {
                             rb.velocity = Vector3.zero;
                         }
                     }
                 }
-            }
-
-            if (clickTeleport && Input.GetMouseButtonDown(1))
-            {
-                TeleportToMousePosition();
-            }
-
-            if (Time.time - lastUpdateTime > UPDATE_INTERVAL)
-            {
-                localPlayer = GetLocalPlayer();
-                lastUpdateTime = Time.time;
-            }
-
-            if (localPlayer != null)
-            {
-                ApplyMovementCheats();
             }
         }
 
@@ -234,6 +317,14 @@ namespace StickFightUltimate
                     background = toggleTexture,
                     textColor = Color.white
                 },
+                onNormal = {
+                    background = toggleTexture,
+                    textColor = Color.green
+                },
+                onHover = {
+                    background = toggleTexture,
+                    textColor = Color.green
+                },
                 fontSize = 12
             };
 
@@ -277,15 +368,16 @@ namespace StickFightUltimate
             DrawTabButtons();
             GUILayout.Space(15);
             
-            GUILayout.BeginScrollView(scrollPosition);
+            scrollPosition = GUILayout.BeginScrollView(scrollPosition);
             switch (selectedTab)
             {
                 case 0: DrawCombatTab(); break;
                 case 1: DrawWeaponsTab(); break;
                 case 2: DrawPlayerTab(); break;
                 case 3: DrawUtilityTab(); break;
-                case 4: DrawMovementTab(); break;
-                case 5: DrawSettingsTab(); break;
+                case 4: DrawCloneTab(); break;
+                case 5: DrawMovementTab(); break;
+                case 6: DrawSettingsTab(); break;
             }
             GUILayout.EndScrollView();
             
@@ -307,14 +399,14 @@ namespace StickFightUltimate
         private void DrawTabButtons()
         {
             GUILayout.BeginHorizontal();
-            string[] tabIcons = { "⚔️", "🔫", "🏃", "🛠️", "🚀", "⚙️" };
+            string[] tabIcons = { "⚔️", "🔫", "🏃", "🛠️", "👥", "🚀", "⚙️" };
             
             for (int i = 0; i < tabNames.Length; i++)
             {
                 bool isSelected = selectedTab == i;
                 GUI.backgroundColor = isSelected ? new Color(0.2f, 0.4f, 0.8f, 0.8f) : new Color(0.3f, 0.3f, 0.3f, 0.6f);
                 
-                if (GUILayout.Button($"{tabIcons[i]} {tabNames[i]}", tabStyle, GUILayout.Height(35)))
+                if (GUILayout.Button($"{tabIcons[i]} {tabNames[i]}", isSelected ? activeTabStyle : tabStyle, GUILayout.Height(35)))
                 {
                     selectedTab = i;
                 }
@@ -422,10 +514,16 @@ namespace StickFightUltimate
 
             int columns = 5;
             int maxWeapons = 50;
+            bool isRowOpen = false;
             
             for (int i = 0; i < maxWeapons; i++)
             {
-                if (i % columns == 0) GUILayout.BeginHorizontal();
+                if (i % columns == 0) 
+                {
+                    if (isRowOpen) GUILayout.EndHorizontal();
+                    GUILayout.BeginHorizontal();
+                    isRowOpen = true;
+                }
                 string weaponName = $"W{i + 1}";
                 
                 if (GUILayout.Button(weaponName, buttonStyle, GUILayout.Width(100), GUILayout.Height(28)))
@@ -433,7 +531,17 @@ namespace StickFightUltimate
                     SpawnSpecificWeaponInSky(i);
                 }
 
-                if (i % columns == columns - 1) GUILayout.EndHorizontal();
+                if (i % columns == columns - 1) 
+                {
+                    GUILayout.EndHorizontal();
+                    isRowOpen = false;
+                }
+            }
+            
+            // Close the last row if it's still open
+            if (isRowOpen) 
+            {
+                GUILayout.EndHorizontal();
             }
         }
 
@@ -536,6 +644,31 @@ namespace StickFightUltimate
             {
                 InstantWin();
             }
+            
+            GUILayout.EndVertical();
+            GUILayout.EndHorizontal();
+            GUILayout.Space(20);
+        }
+
+        private void DrawCloneTab()
+        {
+            GUILayout.Label("👥 CLONE", headerStyle);
+            GUILayout.Space(15);
+
+            GUILayout.BeginHorizontal();
+            GUI.backgroundColor = cloneMode ? new Color(0.2f, 0.8f, 0.2f, 0.3f) : new Color(0.3f, 0.3f, 0.3f, 0.2f);
+            GUILayout.BeginVertical("box", GUILayout.Width(250));
+            GUI.backgroundColor = Color.white;
+            
+            GUILayout.BeginHorizontal();
+            cloneMode = GUILayout.Toggle(cloneMode, "", toggleStyle, GUILayout.Width(30));
+            GUILayout.Label("Clone Mode", GUILayout.Width(100));
+            GUILayout.Label(cloneMode ? "👥 ON" : "❌ OFF", GUILayout.Width(80));
+            GUILayout.EndHorizontal();
+            
+            GUILayout.Label("Creates long-lasting Blink Dagger style clones", GUI.skin.label);
+            GUILayout.Label("Clones fade slowly over ~10 seconds", GUI.skin.label);
+            GUILayout.Label("Full opacity with your exact pose and weapon", GUI.skin.label);
             
             GUILayout.EndVertical();
             GUILayout.EndHorizontal();
@@ -646,14 +779,13 @@ namespace StickFightUltimate
         // Give us unlimited ammo - never run out again!
         private void RefillAllAmmo()
         {
-            var localPlayer = GetLocalPlayer();
-            if (localPlayer != null)
+            var controller = GetLocalPlayer();
+            if (controller != null)
             {
-                var fighting = localPlayer.GetComponent<Fighting>();
+                var fighting = controller.GetComponent<Fighting>();
                 if (fighting != null)
                 {
                     // Set bulletsLeft to a huge number
-                    var bulletsLeftField = typeof(Fighting).GetField("bulletsLeft", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
                     if (bulletsLeftField != null)
                     {
                         bulletsLeftField.SetValue(fighting, 99999);
@@ -662,7 +794,6 @@ namespace StickFightUltimate
                     // Reset currentShots so we don't have to reload
                     if (fighting.weapon != null)
                     {
-                        var currentShotsField = typeof(Weapon).GetField("currentShots", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
                         if (currentShotsField != null)
                         {
                             currentShotsField.SetValue(fighting.weapon, 0);
@@ -672,58 +803,13 @@ namespace StickFightUltimate
             }
         }
         
-        // Win the round instantly - because why not?
-        private void InstantWin()
-        {
-            var localPlayer = GetLocalPlayer();
-            if (localPlayer != null && GameManager.Instance != null)
-            {
-                // Use some magic reflection to call the private win method
-                var allButOneDiedMethod = typeof(GameManager).GetMethod("AllButOnePlayersDied", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-                if (allButOneDiedMethod != null)
-                {
-                    // Remove everyone except us from the alive list
-                    var playersAliveField = typeof(GameManager).GetField("playersAlive", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-                    if (playersAliveField != null)
-                    {
-                        var playersAlive = playersAliveField.GetValue(GameManager.Instance) as List<Controller>;
-                        if (playersAlive != null)
-                        {
-                            // Kick everyone else out
-                            var playersToRemove = new List<Controller>();
-                            foreach (var player in playersAlive)
-                            {
-                                if (player != localPlayer)
-                                {
-                                    playersToRemove.Add(player);
-                                }
-                            }
-                            
-                            foreach (var player in playersToRemove)
-                            {
-                                playersAlive.Remove(player);
-                            }
-                            
-                            // Call the win method
-                            allButOneDiedMethod.Invoke(GameManager.Instance, null);
-                            
-                            // Put everyone back (optional)
-                            foreach (var player in playersToRemove)
-                            {
-                                playersAlive.Add(player);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
+        
         // Get all the enemies so we can mess with them
         private List<Controller> GetEnemyPlayers()
         {
             List<Controller> enemies = new List<Controller>();
             Controller local = GetLocalPlayer();
-            if (local == null) return enemies;
+            if (local == null || GameManager.Instance?.playersAlive == null) return enemies;
 
             foreach (Controller player in GameManager.Instance.playersAlive)
             {
@@ -735,17 +821,35 @@ namespace StickFightUltimate
             return enemies;
         }
 
-        #endregion
 
         // Apply all our movement cheats
         private void ApplyMovementCheats()
         {
             if (localPlayer == null) return;
 
+            // Check if local player instance changed
+            if (collidersStored && localPlayer != storedController)
+            {
+                // Restore old controller's state before clearing caches
+                RestoreOriginalState(storedController);
+                
+                // Clear old state and recapture for new controller
+                originalColliderStates.Clear();
+                cachedColliders = null;
+                collidersStored = false;
+                storedController = null;
+            }
+
             // Remember how things were when we started
             if (!collidersStored)
             {
                 originalCanFly = localPlayer.canFly;
+                cachedColliders = localPlayer.GetComponentsInChildren<Collider>();
+                foreach (var collider in cachedColliders)
+                {
+                    originalColliderStates[collider] = collider.enabled;
+                }
+                storedController = localPlayer;
                 collidersStored = true;
             }
 
@@ -755,20 +859,28 @@ namespace StickFightUltimate
                 // Turn on flight when noclip is on
                 localPlayer.canFly = true;
                 
-                // Turn off all colliders so we can walk through stuff
-                var currentColliders = localPlayer.GetComponentsInChildren<Collider>();
-                foreach (var collider in currentColliders)
+                // Turn off all colliders so we can walk through stuff (use cached list)
+                if (cachedColliders != null)
                 {
-                    collider.enabled = false;
+                    foreach (var collider in cachedColliders)
+                    {
+                        if (collider != null)
+                            collider.enabled = false;
+                    }
                 }
             }
             else
             {
-                // Turn colliders back on when noclip is off
-                var currentColliders = localPlayer.GetComponentsInChildren<Collider>();
-                foreach (var collider in currentColliders)
+                // Restore colliders to their original states (use cached list)
+                if (cachedColliders != null)
                 {
-                    collider.enabled = true;
+                    foreach (var collider in cachedColliders)
+                    {
+                        if (collider != null && originalColliderStates.ContainsKey(collider))
+                        {
+                            collider.enabled = originalColliderStates[collider];
+                        }
+                    }
                 }
             }
 
@@ -783,15 +895,38 @@ namespace StickFightUltimate
                 localPlayer.canFly = originalCanFly;
             }
         }
+        
+        // Restore original state for a controller (used during player change and cleanup)
+        private void RestoreOriginalState(Controller controller)
+        {
+            if (controller == null) return;
+            
+            // Only restore if we have a snapshot for this specific controller
+            if (storedController != controller || !collidersStored) return;
+            
+            // Restore original flight capability
+            controller.canFly = originalCanFly;
+            
+            // Restore original collider states
+            if (cachedColliders != null)
+            {
+                foreach (var collider in cachedColliders)
+                {
+                    if (collider != null && originalColliderStates.ContainsKey(collider))
+                    {
+                        collider.enabled = originalColliderStates[collider];
+                    }
+                }
+            }
+        }
 
         // Weapon spawning stuff
         // Give us a random weapon
         private void SpawnRandomWeapon()
         {
-            var controller = GetLocalPlayer();
-            if (controller == null) return;
+            if (localPlayer == null) return;
 
-            var fighting = controller.GetComponent<Fighting>();
+            var fighting = localPlayer.GetComponent<Fighting>();
             if (fighting == null) return;
 
             int weaponIndex = UnityEngine.Random.Range(0, 50);
@@ -803,10 +938,9 @@ namespace StickFightUltimate
         // Spawn a specific weapon in the sky
         private void SpawnSpecificWeaponInSky(int weaponIndex)
         {
-            var controller = GetLocalPlayer();
-            if (controller == null) return;
+            if (localPlayer == null) return;
 
-            var fighting = controller.GetComponent<Fighting>();
+            var fighting = localPlayer.GetComponent<Fighting>();
             if (fighting == null) return;
 
             weaponIndex = Mathf.Clamp(weaponIndex, 0, 49);
@@ -818,10 +952,9 @@ namespace StickFightUltimate
         // Spawn ALL the weapons - weapon paradise!
         private void SpawnAllWeaponsInSky()
         {
-            var controller = GetLocalPlayer();
-            if (controller == null) return;
+            if (localPlayer == null) return;
 
-            var fighting = controller.GetComponent<Fighting>();
+            var fighting = localPlayer.GetComponent<Fighting>();
             if (fighting == null) return;
 
             for (int i = 0; i < 50; i++)
@@ -842,8 +975,7 @@ namespace StickFightUltimate
                 var health = enemy.GetComponent<HealthHandler>();
                 if (health != null)
                 {
-                    Vector3 direction = Vector3.zero;
-                    health.TakeDamage(9999999f, GetLocalPlayer(), DamageType.Other, false, Vector3.zero, Vector3.zero);
+                    health.TakeDamage(9999999f, localPlayer, DamageType.Other, false, Vector3.zero, Vector3.zero);
                 }
             }
             
@@ -857,6 +989,13 @@ namespace StickFightUltimate
             var controller = GetLocalPlayer();
             if (controller == null) return;
 
+            if (Camera.main == null)
+            {
+                if (showNotifications)
+                    MelonLogger.Msg("Cannot teleport: No camera found");
+                return;
+            }
+
             Vector3 mousePos = Input.mousePosition;
             mousePos.z = 10f;
             Vector3 worldPos = Camera.main.ScreenToWorldPoint(mousePos);
@@ -866,15 +1005,80 @@ namespace StickFightUltimate
                 MelonLogger.Msg("Teleported to mouse position");
         }
 
+        // Clone player - using Blink Dagger's LeaveTrail system with slow fade
+        private void ClonePlayer()
+        {
+            if (localPlayer == null) return;
+            
+            // Get the Renderers component from player (like Blink Dagger does)
+            var rends = localPlayer.transform.root.GetComponentInChildren<Renderers>();
+            if (rends == null) return;
+            
+            // Create clone using exact Blink Dagger LeaveTrail method
+            var clone = UnityEngine.Object.Instantiate<GameObject>(rends.gameObject, rends.transform.position, rends.transform.rotation);
+            clone.name = "BlinkClone";
+            
+            // Disable all MonoBehaviour components (like Blink Dagger does)
+            foreach (MonoBehaviour monoBehaviour in clone.GetComponentsInChildren<MonoBehaviour>())
+            {
+                monoBehaviour.enabled = false;
+            }
+            
+            // Add custom slow fade to SpriteRenderers
+            foreach (SpriteRenderer spriteRenderer in clone.GetComponentsInChildren<SpriteRenderer>())
+            {
+                spriteRenderer.gameObject.AddComponent<SlowFadeSprite>();
+            }
+            
+            // Add custom slow fade to LineRenderers
+            foreach (LineRenderer lineRenderer in clone.GetComponentsInChildren<LineRenderer>())
+            {
+                lineRenderer.gameObject.AddComponent<SlowFadeSprite>();
+            }
+            
+            // Add RemoveOnLevelChange component (like Blink Dagger does)
+            clone.AddComponent<RemoveOnLevelChange>();
+            
+            if (showNotifications)
+                MelonLogger.Msg("Long-lasting Blink Dagger clone created!");
+        }
+
+        private void InstantWin()
+        {
+            if (localPlayer == null) return;
+
+            // Try to find and call the game's win method
+            var gameManager = GameManager.Instance;
+            if (gameManager != null)
+            {
+                // Set all enemies as dead to trigger win condition
+                var enemies = GetEnemyPlayers();
+                foreach (var enemy in enemies)
+                {
+                    var health = enemy.GetComponent<HealthHandler>();
+                    if (health != null)
+                    {
+                        health.TakeDamage(9999999f, localPlayer, DamageType.Other, false, Vector3.zero, Vector3.zero);
+                    }
+                }
+                
+                if (showNotifications)
+                    MelonLogger.Msg("Instant win activated!");
+            }
+        }
+
         // Hook into the game with Harmony patches
         private void ApplyHarmonyPatches()
         {
+            int successCount = 0;
+            var patchAttempts = new List<string>();
+            
             try
             {
                 var harmony = HarmonyInstance;
                 
                 // Better TakeDamage patch for god mode
-                var takeDamageMethod = typeof(HealthHandler).GetMethod("TakeDamage", new Type[] 
+                var takeDamageMethod = AccessTools.Method(typeof(HealthHandler), "TakeDamage", new Type[] 
                 {
                     typeof(float), 
                     typeof(Controller), 
@@ -883,47 +1087,89 @@ namespace StickFightUltimate
                     typeof(Vector3),
                     typeof(Vector3)
                 });
-                
+                patchAttempts.Add("TakeDamage");
                 if (takeDamageMethod != null)
                 {
                     harmony.Patch(takeDamageMethod, new HarmonyMethod(typeof(ModMain).GetMethod("TakeDamage_Combined")));
+                    MelonLogger.Msg($"✓ TakeDamage patch applied: {takeDamageMethod.DeclaringType.Name}.{takeDamageMethod.Name}");
+                    successCount++;
+                }
+                else
+                {
+                    MelonLogger.Msg("✗ Failed to find TakeDamage method");
                 }
 
                 // Stop us from dying
-                harmony.Patch(
-                    typeof(HealthHandler).GetMethod("Die"),
-                    new HarmonyMethod(typeof(ModMain).GetMethod("Die_Prefix"))
-                );
+                var dieMethod = AccessTools.Method(typeof(HealthHandler), "Die");
+                patchAttempts.Add("Die");
+                if (dieMethod != null)
+                {
+                    harmony.Patch(dieMethod, new HarmonyMethod(typeof(ModMain).GetMethod("Die_Prefix")));
+                    MelonLogger.Msg($"✓ Die patch applied: {dieMethod.DeclaringType.Name}.{dieMethod.Name}");
+                    successCount++;
+                }
+                else
+                {
+                    MelonLogger.Msg("✗ Failed to find Die method");
+                }
 
                 // Infinite ammo patch for shooting
-                var shootMethod = typeof(Weapon).GetMethod("ActuallyShoot");
+                var shootMethod = AccessTools.Method(typeof(Weapon), "ActuallyShoot");
+                patchAttempts.Add("ActuallyShoot");
                 if (shootMethod != null)
                 {
                     harmony.Patch(shootMethod, new HarmonyMethod(typeof(ModMain).GetMethod("ActuallyShoot_Prefix")));
+                    MelonLogger.Msg($"✓ ActuallyShoot patch applied: {shootMethod.DeclaringType.Name}.{shootMethod.Name}");
+                    successCount++;
+                }
+                else
+                {
+                    MelonLogger.Msg("✗ Failed to find ActuallyShoot method");
                 }
 
                 // No cooldown patch for attacking
-                var attackMethod = typeof(Fighting).GetMethod("Attack");
+                var attackMethod = AccessTools.Method(typeof(Fighting), "Attack");
+                patchAttempts.Add("Attack");
                 if (attackMethod != null)
                 {
                     harmony.Patch(attackMethod, new HarmonyMethod(typeof(ModMain).GetMethod("Attack_Prefix")));
+                    MelonLogger.Msg($"✓ Attack patch applied: {attackMethod.DeclaringType.Name}.{attackMethod.Name}");
+                    successCount++;
+                }
+                else
+                {
+                    MelonLogger.Msg("✗ Failed to find Attack method");
                 }
 
                 // Stop weapon throwing for infinite ammo
-                var throwWeaponMethod = typeof(Fighting).GetMethod("ThrowWeapon", new Type[] { typeof(bool) });
+                var throwWeaponMethod = AccessTools.Method(typeof(Fighting), "ThrowWeapon", new Type[] { typeof(bool) });
+                patchAttempts.Add("ThrowWeapon");
                 if (throwWeaponMethod != null)
                 {
                     harmony.Patch(throwWeaponMethod, new HarmonyMethod(typeof(ModMain).GetMethod("ThrowWeapon_Prefix")));
+                    MelonLogger.Msg($"✓ ThrowWeapon patch applied: {throwWeaponMethod.DeclaringType.Name}.{throwWeaponMethod.Name}");
+                    successCount++;
+                }
+                else
+                {
+                    MelonLogger.Msg("✗ Failed to find ThrowWeapon method");
                 }
 
                 // Network weapon throwing prevention for infinite ammo
-                var networkThrowWeaponMethod = typeof(Fighting).GetMethod("NetworkThrowWeapon", new Type[] { typeof(bool), typeof(byte), typeof(Vector3), typeof(Vector3), typeof(ushort), typeof(ushort) });
+                var networkThrowWeaponMethod = AccessTools.Method(typeof(Fighting), "NetworkThrowWeapon", new Type[] { typeof(bool), typeof(byte), typeof(Vector3), typeof(Vector3), typeof(ushort), typeof(ushort) });
+                patchAttempts.Add("NetworkThrowWeapon");
                 if (networkThrowWeaponMethod != null)
                 {
-                    harmony.Patch(networkThrowWeaponMethod, prefix: new HarmonyMethod(typeof(ModMain).GetMethod(nameof(NetworkThrowWeapon_Prefix))));
+                    harmony.Patch(networkThrowWeaponMethod, new HarmonyMethod(typeof(ModMain).GetMethod(nameof(NetworkThrowWeapon_Prefix))));
+                    MelonLogger.Msg($"✓ NetworkThrowWeapon patch applied: {networkThrowWeaponMethod.DeclaringType.Name}.{networkThrowWeaponMethod.Name}");
+                    successCount++;
+                }
+                else
+                {
+                    MelonLogger.Msg("✗ Failed to find NetworkThrowWeapon method");
                 }
 
-                MelonLogger.Msg("All Harmony patches applied successfully!");
+                MelonLogger.Msg($"Harmony patches: {successCount}/{patchAttempts.Count} applied successfully!");
             }
             catch (Exception ex)
             {
@@ -992,13 +1238,11 @@ namespace StickFightUltimate
             if (main.infiniteAmmo)
             {
                 // Reset shots so we don't have to reload
-                var currentShotsField = typeof(Weapon).GetField("currentShots", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
                 if (currentShotsField != null)
                 {
                     currentShotsField.SetValue(__instance, 0);
                 }
                 // Make sure we never run out of bullets
-                var bulletsLeftField = typeof(Fighting).GetField("bulletsLeft", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
                 if (bulletsLeftField != null)
                 {
                     var fighting = __instance.GetComponent<Fighting>();
@@ -1023,7 +1267,6 @@ namespace StickFightUltimate
             if (main.infiniteAmmo && !justDrop)
             {
                 // Reset bullets to stop the throwing
-                var bulletsLeftField = typeof(Fighting).GetField("bulletsLeft", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
                 if (bulletsLeftField != null)
                 {
                     bulletsLeftField.SetValue(__instance, 99999);
@@ -1045,7 +1288,6 @@ namespace StickFightUltimate
             if (main.infiniteAmmo && !justDrop)
             {
                 // Reset bullets to stop the throwing
-                var bulletsLeftField = typeof(Fighting).GetField("bulletsLeft", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
                 if (bulletsLeftField != null)
                 {
                     bulletsLeftField.SetValue(__instance, 99999);
