@@ -83,6 +83,7 @@ public class ModMain : MelonMod
         public bool flyMode = false;
         public bool clickTeleport = false;
         public bool noClip = false;
+        public bool noKnockback = false;
         
         // Clone functionality
         public bool cloneMode = false;
@@ -90,6 +91,20 @@ public class ModMain : MelonMod
         // Clone timing control - limit to 1 clone every 3 seconds
         private float lastCloneTime = 0f;
         private const float CLONE_COOLDOWN = 3f;
+        
+        // Health restoration timing
+        private float lastHealthRestore = 0f;
+        private const float HEALTH_RESTORE_INTERVAL = 1f;
+        
+        // Custom admin-style flight system
+        private Vector3 customFlyVelocity = Vector3.zero;
+        private float customFlySpeed = 3f; // Much faster and more responsive
+        private float customFlyAcceleration = 50f;
+        private float customFlyDrag = 10f;
+        
+        // Wings system for fly mode
+        private GameObject[] wingObjects = new GameObject[0];
+        private bool wingsCreated = false;
         
         // Remember how things were so we can put them back later
         private bool originalCanFly = false;
@@ -114,6 +129,15 @@ public class ModMain : MelonMod
         // Cached reflection objects for performance
         private static readonly System.Reflection.FieldInfo bulletsLeftField = typeof(Fighting).GetField("bulletsLeft", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
         private static readonly System.Reflection.FieldInfo currentShotsField = typeof(Weapon).GetField("currentShots", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+
+        private struct RecoilSnapshot
+        {
+            public float recoil;
+            public float torsoRecoil;
+            public float screenShakeAmount;
+        }
+
+        private static readonly Dictionary<int, RecoilSnapshot> recoilSnapshots = new Dictionary<int, RecoilSnapshot>();
         
         // Store original collider states for proper restoration
         private Dictionary<Collider, bool> originalColliderStates = new Dictionary<Collider, bool>();
@@ -185,11 +209,18 @@ public class ModMain : MelonMod
             // NoClip automatically turns on flight - makes sense right?
             if (noClip)
             {
-                // Turn on flight if noclip is on
+                // Turn on flight if noclip is on (this is just UI state, actual flight handled in ApplyMovementCheats)
                 if (!flyMode)
                 {
                     flyMode = true;
+                    if (showNotifications)
+                        MelonLogger.Msg("NoClip enabled: Flight automatically activated");
                 }
+            }
+            else if (!noClip && flyMode)
+            {
+                // If noclip is turned off but fly mode is still on in UI, keep flight
+                // This allows manual flight control
             }
             
             // Hold to shoot with no cooldown
@@ -222,6 +253,9 @@ public class ModMain : MelonMod
                 localPlayer = GetLocalPlayer();
                 lastUpdateTime = Time.time;
             }
+            
+            // Apply movement cheats every frame for smooth operation
+            ApplyMovementCheats();
 
             // Clone mode - create duplicate of player (limited to 1 every 3 seconds)
             if (cloneMode && localPlayer != null)
@@ -243,6 +277,26 @@ public class ModMain : MelonMod
             }
             
             lastInstantWinState = currentInstantWinState;
+            
+            // Health restoration for god mode - every second
+            if (godMode && Time.time - lastHealthRestore >= HEALTH_RESTORE_INTERVAL)
+            {
+                if (localPlayer != null)
+                {
+                    var health = localPlayer.GetComponent<HealthHandler>();
+                    if (health != null)
+                    {
+                        health.health = 9999999f;
+                        var charInfo = localPlayer.GetComponent<CharacterInformation>();
+                        if (charInfo != null)
+                        {
+                            charInfo.isDead = false;
+                        }
+                    }
+                }
+                lastHealthRestore = Time.time;
+            }
+            
             // GOD MODE - keep us alive no matter what
             if (godMode)
             {
@@ -251,7 +305,7 @@ public class ModMain : MelonMod
                     var health = localPlayer.GetComponent<HealthHandler>();
                     if (health != null)
                     {
-                        health.health = 999999f;
+                        health.health = 9999999f;
                         var charInfo = localPlayer.GetComponent<CharacterInformation>();
                         if (charInfo != null)
                         {
@@ -491,6 +545,13 @@ public class ModMain : MelonMod
             GUILayout.Space(20);
         }
 
+        private void DrawFlySpeedSlider()
+        {
+            GUILayout.Space(5);
+            GUILayout.Label($"Flight Speed: {customFlySpeed:0.0}", GUI.skin.label);
+            customFlySpeed = GUILayout.HorizontalSlider(customFlySpeed, 0.5f, 8f, GUILayout.Width(220));
+        }
+
         private void DrawWeaponsTab()
         {
             GUILayout.Label("🔫 WEAPONS", headerStyle);
@@ -549,62 +610,6 @@ public class ModMain : MelonMod
         {
             GUILayout.Label("🏃 PLAYER", headerStyle);
             GUILayout.Space(15);
-
-            GUILayout.BeginHorizontal();
-            GUI.backgroundColor = flyMode ? new Color(0.2f, 0.8f, 0.2f, 0.3f) : new Color(0.3f, 0.3f, 0.3f, 0.2f);
-            GUILayout.BeginVertical("box", GUILayout.Width(250));
-            GUI.backgroundColor = Color.white;
-            
-            GUILayout.BeginHorizontal();
-            flyMode = GUILayout.Toggle(flyMode, "", toggleStyle, GUILayout.Width(30));
-            GUILayout.Label("Fly Mode", GUILayout.Width(100));
-            GUILayout.Label(flyMode ? "✅ ON" : "❌ OFF", GUILayout.Width(80));
-            GUILayout.EndHorizontal();
-            
-            GUILayout.Label("Enable flight (works alone or with noclip)", GUI.skin.label);
-            GUILayout.Label("Noclip automatically enables this", GUI.skin.label);
-            GUILayout.Label("Use WASD to fly freely", GUI.skin.label);
-            
-            GUILayout.EndVertical();
-            GUILayout.EndHorizontal();
-            GUILayout.Space(15);
-
-            GUILayout.BeginHorizontal();
-            GUI.backgroundColor = clickTeleport ? new Color(0.2f, 0.8f, 0.2f, 0.3f) : new Color(0.3f, 0.3f, 0.3f, 0.2f);
-            GUILayout.BeginVertical("box", GUILayout.Width(250));
-            GUI.backgroundColor = Color.white;
-            
-            GUILayout.BeginHorizontal();
-            clickTeleport = GUILayout.Toggle(clickTeleport, "", toggleStyle, GUILayout.Width(30));
-            GUILayout.Label("Click Teleport", GUILayout.Width(100));
-            GUILayout.Label(clickTeleport ? "🎯 ON" : "❌ OFF", GUILayout.Width(80));
-            GUILayout.EndHorizontal();
-            
-            GUILayout.Label("Right click to teleport anywhere", GUI.skin.label);
-            GUILayout.Label("Instant mouse position teleport", GUI.skin.label);
-            
-            GUILayout.EndVertical();
-            GUILayout.EndHorizontal();
-            GUILayout.Space(15);
-
-            GUILayout.BeginHorizontal();
-            GUI.backgroundColor = noClip ? new Color(0.2f, 0.8f, 0.2f, 0.3f) : new Color(0.3f, 0.3f, 0.3f, 0.2f);
-            GUILayout.BeginVertical("box", GUILayout.Width(250));
-            GUI.backgroundColor = Color.white;
-            
-            GUILayout.BeginHorizontal();
-            noClip = GUILayout.Toggle(noClip, "", toggleStyle, GUILayout.Width(30));
-            GUILayout.Label("No Clip", GUILayout.Width(100));
-            GUILayout.Label(noClip ? "👻 ON" : "❌ OFF", GUILayout.Width(80));
-            GUILayout.EndHorizontal();
-            
-            GUILayout.Label("Walk through walls and objects", GUI.skin.label);
-            GUILayout.Label("Automatically enables flight", GUI.skin.label);
-            GUILayout.Label("Collision disabled for player", GUI.skin.label);
-            
-            GUILayout.EndVertical();
-            GUILayout.EndHorizontal();
-            GUILayout.Space(20);
         }
 
         private void DrawUtilityTab()
@@ -691,10 +696,29 @@ public class ModMain : MelonMod
             GUILayout.Label(flyMode ? "✅ ON" : "❌ OFF", GUILayout.Width(80));
             GUILayout.EndHorizontal();
             
-            GUILayout.Label("Enable flight (works alone or with noclip)", GUI.skin.label);
-            GUILayout.Label("Noclip automatically enables this", GUI.skin.label);
-            GUILayout.Label("Use WASD to fly freely", GUI.skin.label);
+            GUILayout.Label("Smooth admin-style flight with wings", GUI.skin.label);
+            GUILayout.Label("WASD: W=up, S=down, A=left, D=right", GUI.skin.label);
+            GUILayout.Label("Direct 2D movement - no physics delay", GUI.skin.label);
+            DrawFlySpeedSlider();
             
+            GUILayout.EndVertical();
+            GUILayout.EndHorizontal();
+            GUILayout.Space(15);
+
+            GUILayout.BeginHorizontal();
+            GUI.backgroundColor = noKnockback ? new Color(0.2f, 0.8f, 0.2f, 0.3f) : new Color(0.3f, 0.3f, 0.3f, 0.2f);
+            GUILayout.BeginVertical("box", GUILayout.Width(250));
+            GUI.backgroundColor = Color.white;
+
+            GUILayout.BeginHorizontal();
+            noKnockback = GUILayout.Toggle(noKnockback, "", toggleStyle, GUILayout.Width(30));
+            GUILayout.Label("No Knockback", GUILayout.Width(100));
+            GUILayout.Label(noKnockback ? "✅ ON" : "❌ OFF", GUILayout.Width(80));
+            GUILayout.EndHorizontal();
+
+            GUILayout.Label("Removes gun recoil/kickback", GUI.skin.label);
+            GUILayout.Label("No backward force when shooting", GUI.skin.label);
+
             GUILayout.EndVertical();
             GUILayout.EndHorizontal();
             GUILayout.Space(15);
@@ -825,7 +849,12 @@ public class ModMain : MelonMod
         // Apply all our movement cheats
         private void ApplyMovementCheats()
         {
-            if (localPlayer == null) return;
+            if (localPlayer == null) 
+            {
+                if (showNotifications && (noClip || flyMode))
+                    MelonLogger.Msg("No local player found for movement cheats!");
+                return;
+            }
 
             // Check if local player instance changed
             if (collidersStored && localPlayer != storedController)
@@ -847,10 +876,15 @@ public class ModMain : MelonMod
                 cachedColliders = localPlayer.GetComponentsInChildren<Collider>();
                 foreach (var collider in cachedColliders)
                 {
-                    originalColliderStates[collider] = collider.enabled;
+                    // If noclip is already enabled when we snapshot, collider.enabled may already be false.
+                    // In normal gameplay these colliders are expected to be enabled, so treat them as enabled.
+                    originalColliderStates[collider] = noClip ? true : collider.enabled;
                 }
                 storedController = localPlayer;
                 collidersStored = true;
+                
+                if (showNotifications)
+                    MelonLogger.Msg($"Movement cheats initialized - colliders found: {cachedColliders.Length}");
             }
 
             // NoClip stuff - turn off all colliders and enable flight
@@ -862,36 +896,89 @@ public class ModMain : MelonMod
                 // Turn off all colliders so we can walk through stuff (use cached list)
                 if (cachedColliders != null)
                 {
+                    int disabledCount = 0;
                     foreach (var collider in cachedColliders)
                     {
                         if (collider != null)
+                        {
                             collider.enabled = false;
+                            disabledCount++;
+                        }
                     }
+                    if (showNotifications && disabledCount > 0)
+                        MelonLogger.Msg($"NoClip: Disabled {disabledCount} colliders");
                 }
             }
             else
             {
-                // Restore colliders to their original states (use cached list)
-                if (cachedColliders != null)
+                // Restore colliders.
+                // Some respawns/scene transitions can invalidate cached collider references; to make noclip reliably
+                // turn off, force-enable all colliders on the player.
+                var currentColliders = localPlayer.GetComponentsInChildren<Collider>(true);
+                int enabledCount = 0;
+                foreach (var collider in currentColliders)
                 {
-                    foreach (var collider in cachedColliders)
+                    if (collider == null) continue;
+
+                    bool shouldEnable;
+                    if (originalColliderStates.TryGetValue(collider, out shouldEnable))
                     {
-                        if (collider != null && originalColliderStates.ContainsKey(collider))
-                        {
-                            collider.enabled = originalColliderStates[collider];
-                        }
+                        collider.enabled = shouldEnable;
                     }
+                    else
+                    {
+                        collider.enabled = true;
+                    }
+
+                    if (collider.enabled) enabledCount++;
                 }
+                if (showNotifications && enabledCount > 0)
+                    MelonLogger.Msg($"NoClip: Restored {enabledCount} colliders");
             }
 
             // Flight mode (only if noclip is off, since noclip already handles it)
             if (flyMode && !noClip)
             {
                 localPlayer.canFly = true;
+                
+                // Create wings when fly mode is enabled (but don't override existing flight settings)
+                if (!wingsCreated)
+                {
+                    CreateWings();
+                }
+                
+                // Disable the game's built-in flight system since we use custom admin flight
+                var movement = localPlayer.GetComponent<Movement>();
+                if (movement != null)
+                {
+                    // We'll handle flight ourselves, so set canFly to false for the game's system
+                    // but keep it true for our custom system
+                }
+                
+                if (showNotifications)
+                    MelonLogger.Msg($"Admin Flight Mode: Enabled - Speed: {customFlySpeed}");
             }
             else if (!flyMode && !noClip)
             {
                 // Put flight back to how it was when we started
+                localPlayer.canFly = originalCanFly;
+                
+                // Remove wings when fly mode is disabled
+                if (wingsCreated)
+                {
+                    RemoveWings();
+                }
+                
+                // Reset custom flight velocity
+                customFlyVelocity = Vector3.zero;
+                
+                if (showNotifications)
+                    MelonLogger.Msg($"Admin Flight Mode: Disabled");
+            }
+
+            // If noclip is off and fly is off, make sure gravity/flight is restored.
+            if (!noClip && !flyMode)
+            {
                 localPlayer.canFly = originalCanFly;
             }
         }
@@ -903,6 +990,12 @@ public class ModMain : MelonMod
             
             // Only restore if we have a snapshot for this specific controller
             if (storedController != controller || !collidersStored) return;
+            
+            // Remove wings if they exist
+            if (wingsCreated)
+            {
+                RemoveWings();
+            }
             
             // Restore original flight capability
             controller.canFly = originalCanFly;
@@ -987,7 +1080,12 @@ public class ModMain : MelonMod
         private void TeleportToMousePosition()
         {
             var controller = GetLocalPlayer();
-            if (controller == null) return;
+            if (controller == null)
+            {
+                if (showNotifications)
+                    MelonLogger.Msg("Cannot teleport: No local player found");
+                return;
+            }
 
             if (Camera.main == null)
             {
@@ -997,12 +1095,40 @@ public class ModMain : MelonMod
             }
 
             Vector3 mousePos = Input.mousePosition;
-            mousePos.z = 10f;
+            mousePos.z = 10f; // Set distance from camera
             Vector3 worldPos = Camera.main.ScreenToWorldPoint(mousePos);
+            
+            // Add some height to prevent teleporting into ground
+            worldPos.y += 2f;
+            
+            // Store original position for debugging
+            Vector3 originalPos = controller.transform.position;
+            
+            // Teleport the player
             controller.transform.position = worldPos;
+            
+            // Make sure player and all renderers are visible after teleport
+            var renderers = controller.GetComponentsInChildren<Renderer>();
+            foreach (var renderer in renderers)
+            {
+                renderer.enabled = true;
+            }
+            
+            // Also ensure the GameObject is active
+            if (!controller.gameObject.activeInHierarchy)
+            {
+                controller.gameObject.SetActive(true);
+            }
+            
+            // Reset any potential invisibility from character info
+            var charInfo = controller.GetComponent<CharacterInformation>();
+            if (charInfo != null)
+            {
+                charInfo.isDead = false;
+            }
 
             if (showNotifications)
-                MelonLogger.Msg("Teleported to mouse position");
+                MelonLogger.Msg($"Teleported from {originalPos} to {worldPos}");
         }
 
         // Clone player - using Blink Dagger's LeaveTrail system with slow fade
@@ -1041,6 +1167,123 @@ public class ModMain : MelonMod
             
             if (showNotifications)
                 MelonLogger.Msg("Long-lasting Blink Dagger clone created!");
+        }
+
+        // Create wings for fly mode
+        private void CreateWings()
+        {
+            if (localPlayer == null || wingsCreated) return;
+            
+            // Find existing wing prefabs or create simple wing objects
+            var setMovementAbility = localPlayer.GetComponent<SetMovementAbility>();
+            if (setMovementAbility != null && setMovementAbility.abilities.Length > 0)
+            {
+                // Use existing wing system from the game
+                var ability = setMovementAbility.abilities[0]; // Use first ability
+                wingObjects = new GameObject[ability.objects.Length];
+                
+                for (int i = 0; i < ability.objects.Length; i++)
+                {
+                    // Instantiate wing objects
+                    wingObjects[i] = UnityEngine.Object.Instantiate(ability.objects[i], localPlayer.transform);
+                    wingObjects[i].SetActive(true);
+                    
+                    // Apply wing material
+                    foreach (ParticleSystemRenderer psr in wingObjects[i].GetComponentsInChildren<ParticleSystemRenderer>(true))
+                    {
+                        if (ability.wingMat != null)
+                            psr.sharedMaterial = ability.wingMat;
+                    }
+                }
+                
+                // Only set fly speed if not already set
+                if (ability.flySpeed > 0 && localPlayer.flySpeed <= 1f)
+                    localPlayer.flySpeed = ability.flySpeed;
+                    
+                if (showNotifications)
+                    MelonLogger.Msg("Wings created using game system!");
+            }
+            else
+            {
+                // Create simple particle wings if no system found
+                CreateSimpleWings();
+            }
+            
+            wingsCreated = true;
+        }
+        
+        // Create simple particle wings as fallback
+        private void CreateSimpleWings()
+        {
+            wingObjects = new GameObject[2];
+            
+            // Left wing
+            var leftWing = new GameObject("LeftWing");
+            leftWing.transform.SetParent(localPlayer.transform);
+            leftWing.transform.localPosition = new Vector3(-0.5f, 0f, 0f);
+            
+            var leftPS = leftWing.AddComponent<ParticleSystem>();
+            var leftMain = leftPS.main;
+            leftMain.startColor = Color.cyan;
+            leftMain.startSize = 0.5f;
+            leftMain.startLifetime = 1f;
+            leftMain.simulationSpace = ParticleSystemSimulationSpace.Local;
+            
+            // Set emission rate using emission module
+            var leftEmission = leftPS.emission;
+            leftEmission.rateOverTime = 50f;
+            
+            var leftRenderer = leftPS.GetComponent<ParticleSystemRenderer>();
+            leftRenderer.material = new Material(Shader.Find("Particles/Standard"));
+            
+            // Right wing
+            var rightWing = new GameObject("RightWing");
+            rightWing.transform.SetParent(localPlayer.transform);
+            rightWing.transform.localPosition = new Vector3(0.5f, 0f, 0f);
+            
+            var rightPS = rightWing.AddComponent<ParticleSystem>();
+            var rightMain = rightPS.main;
+            rightMain.startColor = Color.cyan;
+            rightMain.startSize = 0.5f;
+            rightMain.startLifetime = 1f;
+            rightMain.simulationSpace = ParticleSystemSimulationSpace.Local;
+            
+            // Set emission rate using emission module
+            var rightEmission = rightPS.emission;
+            rightEmission.rateOverTime = 50f;
+            
+            var rightRenderer = rightPS.GetComponent<ParticleSystemRenderer>();
+            rightRenderer.material = new Material(Shader.Find("Particles/Standard"));
+            
+            wingObjects[0] = leftWing;
+            wingObjects[1] = rightWing;
+            
+            // Only set fly speed if not already set
+            if (localPlayer.flySpeed <= 1f)
+                localPlayer.flySpeed = 2f;
+            
+            if (showNotifications)
+                MelonLogger.Msg("Simple particle wings created!");
+        }
+        
+        // Remove wings
+        private void RemoveWings()
+        {
+            if (!wingsCreated) return;
+            
+            foreach (var wing in wingObjects)
+            {
+                if (wing != null)
+                    UnityEngine.Object.Destroy(wing);
+            }
+            
+            // Don't modify canFly here - let the flight logic handle it
+            
+            wingObjects = new GameObject[0];
+            wingsCreated = false;
+            
+            if (showNotifications)
+                MelonLogger.Msg("Wings removed!");
         }
 
         private void InstantWin()
@@ -1118,7 +1361,9 @@ public class ModMain : MelonMod
                 patchAttempts.Add("ActuallyShoot");
                 if (shootMethod != null)
                 {
-                    harmony.Patch(shootMethod, new HarmonyMethod(typeof(ModMain).GetMethod("ActuallyShoot_Prefix")));
+                    harmony.Patch(shootMethod,
+                        prefix: new HarmonyMethod(typeof(ModMain).GetMethod("ActuallyShoot_Prefix")),
+                        postfix: new HarmonyMethod(typeof(ModMain).GetMethod(nameof(ActuallyShoot_Postfix))));
                     MelonLogger.Msg($"✓ ActuallyShoot patch applied: {shootMethod.DeclaringType.Name}.{shootMethod.Name}");
                     successCount++;
                 }
@@ -1167,6 +1412,62 @@ public class ModMain : MelonMod
                 else
                 {
                     MelonLogger.Msg("✗ Failed to find NetworkThrowWeapon method");
+                }
+                
+                // Movement patch to handle flight controls
+                var movementUpdateMethod = AccessTools.Method(typeof(Movement), "FixedUpdate");
+                patchAttempts.Add("Movement FixedUpdate");
+                if (movementUpdateMethod != null)
+                {
+                    harmony.Patch(movementUpdateMethod, new HarmonyMethod(typeof(ModMain).GetMethod("Movement_FixedUpdate_Prefix")));
+                    MelonLogger.Msg($"✓ Movement FixedUpdate patch applied: {movementUpdateMethod.DeclaringType.Name}.{movementUpdateMethod.Name}");
+                    successCount++;
+                }
+                else
+                {
+                    MelonLogger.Msg("✗ Failed to find Movement FixedUpdate method");
+                }
+
+                // BodyPart TakeDamageWithParticle patch 1 (punches, gunshots, etc.)
+                var bodyPartDamageMethod1 = AccessTools.Method(typeof(BodyPart), "TakeDamageWithParticle", new Type[] 
+                {
+                    typeof(float), 
+                    typeof(Vector3), 
+                    typeof(Vector3), 
+                    typeof(Controller), 
+                    typeof(DamageType)
+                });
+                patchAttempts.Add("BodyPart TakeDamageWithParticle 1");
+                if (bodyPartDamageMethod1 != null)
+                {
+                    harmony.Patch(bodyPartDamageMethod1, new HarmonyMethod(typeof(ModMain).GetMethod("TakeDamageWithParticle_Prefix1")));
+                    MelonLogger.Msg($"✓ BodyPart TakeDamageWithParticle 1 patch applied: {bodyPartDamageMethod1.DeclaringType.Name}.{bodyPartDamageMethod1.Name}");
+                    successCount++;
+                }
+                else
+                {
+                    MelonLogger.Msg("✗ Failed to find BodyPart TakeDamageWithParticle method 1");
+                }
+
+                // BodyPart TakeDamageWithParticle patch 2 (physical damage)
+                var bodyPartDamageMethod2 = AccessTools.Method(typeof(BodyPart), "TakeDamageWithParticle", new Type[] 
+                {
+                    typeof(float), 
+                    typeof(Vector3), 
+                    typeof(Vector3), 
+                    typeof(bool), 
+                    typeof(Controller)
+                });
+                patchAttempts.Add("BodyPart TakeDamageWithParticle 2");
+                if (bodyPartDamageMethod2 != null)
+                {
+                    harmony.Patch(bodyPartDamageMethod2, new HarmonyMethod(typeof(ModMain).GetMethod("TakeDamageWithParticle_Prefix2")));
+                    MelonLogger.Msg($"✓ BodyPart TakeDamageWithParticle 2 patch applied: {bodyPartDamageMethod2.DeclaringType.Name}.{bodyPartDamageMethod2.Name}");
+                    successCount++;
+                }
+                else
+                {
+                    MelonLogger.Msg("✗ Failed to find BodyPart TakeDamageWithParticle method 2");
                 }
 
                 MelonLogger.Msg($"Harmony patches: {successCount}/{patchAttempts.Count} applied successfully!");
@@ -1227,12 +1528,91 @@ public class ModMain : MelonMod
             return true;
         }
 
+        [HarmonyPostfix]
+        public static void ActuallyShoot_Postfix(Weapon __instance)
+        {
+            int id = __instance.GetInstanceID();
+            if (recoilSnapshots.TryGetValue(id, out var snap))
+            {
+                __instance.recoil = snap.recoil;
+                __instance.torsoRecoil = snap.torsoRecoil;
+                __instance.screenShakeAmount = snap.screenShakeAmount;
+                recoilSnapshots.Remove(id);
+            }
+        }
+
+        // Stop damage from BodyPart TakeDamageWithParticle (punches, gunshots, etc.)
+        [HarmonyPrefix]
+        public static bool TakeDamageWithParticle_Prefix1(BodyPart __instance, float damage, Vector3 position, Vector3 direction, Controller damager, DamageType type = DamageType.Other)
+        {
+            var main = Melon<ModMain>.Instance;
+            if (main == null) return true;
+
+            var controller = __instance.GetComponentInParent<Controller>();
+            var localController = main.GetLocalPlayer();
+
+            // God Mode - no damage from body parts
+            if (main.godMode && controller == localController)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        // Stop damage from BodyPart TakeDamageWithParticle (physical damage)
+        [HarmonyPrefix]
+        public static bool TakeDamageWithParticle_Prefix2(BodyPart __instance, float damage, Vector3 position, Vector3 direction, bool physicalDamage, Controller damager)
+        {
+            var main = Melon<ModMain>.Instance;
+            if (main == null) return true;
+
+            var controller = __instance.GetComponentInParent<Controller>();
+            var localController = main.GetLocalPlayer();
+
+            // God Mode - no damage from body parts
+            if (main.godMode && controller == localController)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
         // Infinite ammo - never run out of bullets
         [HarmonyPrefix]
         public static bool ActuallyShoot_Prefix(Weapon __instance)
         {
             var main = Melon<ModMain>.Instance;
             if (main == null) return true;
+
+            // No Knockback - temporarily remove recoil/kickback for local player shots.
+            // Weapon.ActuallyShoot applies recoil via rig.AddForce / rigTorso.AddForce and screenshake.
+            if (main.noKnockback)
+            {
+                var localController = main.GetLocalPlayer();
+                if (localController != null)
+                {
+                    var weaponController = __instance.transform.root.GetComponent<Controller>();
+                    if (weaponController == localController)
+                    {
+                        int id = __instance.GetInstanceID();
+                        if (!recoilSnapshots.ContainsKey(id))
+                        {
+                            recoilSnapshots[id] = new RecoilSnapshot
+                            {
+                                recoil = __instance.recoil,
+                                torsoRecoil = __instance.torsoRecoil,
+                                screenShakeAmount = __instance.screenShakeAmount
+                            };
+                        }
+
+                        __instance.recoil = 0f;
+                        __instance.torsoRecoil = 0f;
+                        __instance.screenShakeAmount = 0f;
+                    }
+                }
+            }
 
             // Infinite Ammo - keep our ammo full
             if (main.infiniteAmmo)
@@ -1317,6 +1697,69 @@ public class ModMain : MelonMod
             }
 
             return true;
+        }
+        
+        // Movement patch to handle flight controls
+        [HarmonyPrefix]
+        public static void Movement_FixedUpdate_Prefix(Movement __instance)
+        {
+            var main = Melon<ModMain>.Instance;
+            if (main == null) return;
+            
+            // Get controller using reflection since it's private
+            var controllerField = typeof(Movement).GetField("controller", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            if (controllerField == null) return;
+            
+            var controller = controllerField.GetValue(__instance) as Controller;
+            if (controller == null) return;
+            
+            var localController = main.GetLocalPlayer();
+            if (controller != localController) return;
+            
+            // Handle flight controls when fly mode is enabled
+            if ((main.flyMode || main.noClip) && controller.canFly)
+            {
+                // Stick Fight is effectively 2D: horizontal movement is along Z (Vector3.forward), vertical is Y.
+                // Use the game's existing fly force system to avoid ragdoll bunching.
+                Vector3 flyDir = Vector3.zero;
+
+                // Up / Down
+                if (Input.GetKey(KeyCode.W) || Input.GetKey(KeyCode.UpArrow))
+                {
+                    flyDir += Vector3.up;
+                }
+                if (Input.GetKey(KeyCode.S) || Input.GetKey(KeyCode.DownArrow))
+                {
+                    flyDir += Vector3.down;
+                }
+
+                // Left / Right (note: in this game, left/right uses +/- Vector3.forward)
+                if (Input.GetKey(KeyCode.A) || Input.GetKey(KeyCode.LeftArrow))
+                {
+                    flyDir += Vector3.forward;
+                }
+                if (Input.GetKey(KeyCode.D) || Input.GetKey(KeyCode.RightArrow))
+                {
+                    flyDir += -Vector3.forward;
+                }
+
+                if (flyDir.sqrMagnitude > 1f)
+                {
+                    flyDir.Normalize();
+                }
+
+                if (flyDir != Vector3.zero)
+                {
+                    // Movement.Fly internally applies Time.deltaTime * 10f, so scale to get a snappy feel.
+                    // This keeps wings/canFly behavior but replaces the clunky boss-style directional issues.
+                    __instance.Fly(flyDir * main.customFlySpeed);
+                }
+            }
+            else
+            {
+                // Reset custom flight velocity when flight is disabled
+                main.customFlyVelocity = Vector3.zero;
+            }
         }
         
         // Put the weapon cooldown back to normal
