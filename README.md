@@ -2,6 +2,8 @@
 
 A mod for Stick Fight: The Game providing various gameplay enhancements and utilities.
 
+![Menu Screenshot](image.png)
+
 ## Features
 
 ### Combat
